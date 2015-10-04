@@ -11,16 +11,30 @@
 % the License.
 
 -module(couch_lru).
--export([new/0, insert/2, update/2, close/1]).
+-export([new/0, insert/2, update/2, close/2, sweep/2, trim/1]).
 
 -include_lib("couch/include/couch_db.hrl").
 
 new() ->
     {gb_trees:empty(), dict:new()}.
 
+close(DbName, {_Tree, Dict}=Lru) ->
+    case dict:find(DbName, Dict) of
+        {ok, DbLru} ->
+            close_int(DbName, DbLru, Lru);
+        error ->
+            {missing, Lru}
+    end.
+
 insert(DbName, {Tree0, Dict0}) ->
     Lru = erlang:now(),
     {gb_trees:insert(Lru, DbName, Tree0), dict:store(DbName, Lru, Dict0)}.
+
+sweep(NumToSweep, {Tree, _Dict}=Lru) ->
+    sweep_int(NumToSweep, 0, Lru, gb_trees:next(gb_trees:iterator(Tree))).
+
+trim({Tree, _Dict}=Lru) ->
+    trim_int(gb_trees:next(gb_trees:iterator(Tree)), Lru).
 
 update(DbName, {Tree0, Dict0}) ->
     case dict:find(DbName, Dict0) of
@@ -34,14 +48,9 @@ update(DbName, {Tree0, Dict0}) ->
         {Tree0, Dict0}
     end.
 
-close({Tree, _} = Cache) ->
-    close_int(gb_trees:next(gb_trees:iterator(Tree)), Cache).
-
 %% internals
 
-close_int(none, _) ->
-    erlang:error(all_dbs_active);
-close_int({Lru, DbName, Iter}, {Tree, Dict} = Cache) ->
+close_int(DbName, DbLru, {Tree0, Dict0}) ->
     case ets:update_element(couch_dbs, DbName, {#db.fd_monitor, locked}) of
     true ->
         [#db{main_pid = Pid} = Db] = ets:lookup(couch_dbs, DbName),
@@ -49,14 +58,33 @@ close_int({Lru, DbName, Iter}, {Tree, Dict} = Cache) ->
             true = ets:delete(couch_dbs, DbName),
             true = ets:delete(couch_dbs_pid_to_name, Pid),
             exit(Pid, kill),
-            {gb_trees:delete(Lru, Tree), dict:erase(DbName, Dict)};
+            {ok, {gb_trees:delete(DbLru, Tree0), dict:erase(DbName, Dict0)}};
         false ->
             true = ets:update_element(couch_dbs, DbName, {#db.fd_monitor, nil}),
-            couch_stats:increment_counter([couchdb, couch_server, lru_skip]),
-            close_int(gb_trees:next(Iter), update(DbName, Cache))
+            {error, db_active}
         end;
     false ->
-        NewTree = gb_trees:delete(Lru, Tree),
-        NewIter = gb_trees:iterator(NewTree),
-        close_int(gb_trees:next(NewIter), {NewTree, dict:erase(DbName, Dict)})
+        {missing, {{gb_trees:delete(DbLru, Tree0), dict:erase(DbName, Dict0)}}}
+    end.
+
+sweep_int(0, NumSweeped, Lru, _) ->
+    {NumSweeped, Lru};
+sweep_int(_, NumSweeped, Lru, none) ->
+    {NumSweeped, Lru};
+sweep_int(NumToSweep, NumSweeped, Lru0, {_DbLru, DbName, Iter}) ->
+    Lru = update(DbName, Lru0),
+    couch_server:close(DbName),
+    sweep_int(NumToSweep - 1, NumSweeped + 1, Lru, gb_trees:next(Iter)).
+
+trim_int(none, _) ->
+    erlang:error(all_dbs_active);
+trim_int({DbLru, DbName, Iter}, Lru0) ->
+    case close_int(DbName, DbLru, Lru0) of
+        {ok, Lru} ->
+            Lru;
+        {missing, Lru} ->
+            trim_int(gb_trees:next(Iter), Lru);
+        {error, db_active} ->
+            couch_stats:increment_counter([couchdb, couch_server, lru_skip]),
+            trim_int(gb_trees:next(Iter), update(DbName, Lru0))
     end.

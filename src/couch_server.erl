@@ -15,25 +15,29 @@
 -behaviour(config_listener).
 -vsn(2).
 
--export([open/2,create/2,delete/2,get_version/0,get_version/1,get_uuid/0]).
+-export([open/2,close/1,create/2,delete/2,get_version/0,get_version/1,get_uuid/0]).
 -export([all_databases/0, all_databases/2]).
 -export([init/1, handle_call/3,sup_start_link/0]).
 -export([handle_cast/2,code_change/3,handle_info/2,terminate/2]).
 -export([dev_start/0,is_admin/2,has_admins/0,get_stats/0]).
--export([close_lru/0]).
 
 % config_listener api
 -export([handle_config_change/5, handle_config_terminate/3]).
 
 -include_lib("couch/include/couch_db.hrl").
 
--define(MAX_DBS_OPEN, 100).
+-define(MAX_DBS_OPEN_HARD, 100).
+-define(MAX_DBS_OPEN_SOFT, 70).
+-define(MAX_SWEEP_SIZE, 10).
 
 -record(server,{
     root_dir = [],
-    max_dbs_open=?MAX_DBS_OPEN,
+    max_dbs_open_hard=?MAX_DBS_OPEN_HARD,
+    max_dbs_open_soft=?MAX_DBS_OPEN_SOFT,
+    dbs_closing=0,
     dbs_open=0,
     start_time="",
+    max_sweep_size=?MAX_SWEEP_SIZE,
     update_lru_on_read=true,
     lru = couch_lru:new()
     }).
@@ -90,14 +94,14 @@ open(DbName, Options0) ->
         end
     end.
 
+close(DbName) ->
+    gen_server:cast(couch_server, {close, DbName}).
+
 update_lru(DbName, Options) ->
     case lists:member(sys_db, Options) of
         false -> gen_server:cast(couch_server, {update_lru, DbName});
         true -> ok
     end.
-
-close_lru() ->
-    gen_server:call(couch_server, close_lru).
 
 create(DbName, Options0) ->
     Options = maybe_add_sys_db_callbacks(DbName, Options0),
@@ -176,8 +180,12 @@ init([]) ->
     % will restart us and then we will pick up the new settings.
 
     RootDir = config:get("couchdb", "database_dir", "."),
-    MaxDbsOpen = list_to_integer(
-            config:get("couchdb", "max_dbs_open", integer_to_list(?MAX_DBS_OPEN))),
+    MaxDbsOpenHard = list_to_integer(
+            config:get("couchdb", "max_dbs_open_hard", integer_to_list(?MAX_DBS_OPEN_HARD))),
+    MaxDbsOpenSoft = list_to_integer(
+            config:get("couchdb", "max_dbs_open_soft", integer_to_list(?MAX_DBS_OPEN_SOFT))),
+    MaxSweepSize = list_to_integer(
+            config:get("couchdb", "max_sweep_size", integer_to_list(?MAX_SWEEP_SIZE))),
     UpdateLruOnRead =
         config:get("couchdb", "update_lru_on_read", "true") =:= "true",
     ok = config:listen_for_changes(?MODULE, nil),
@@ -187,7 +195,9 @@ init([]) ->
     ets:new(couch_dbs_pid_to_name, [set, protected, named_table]),
     process_flag(trap_exit, true),
     {ok, #server{root_dir=RootDir,
-                max_dbs_open=MaxDbsOpen,
+                max_dbs_open_hard=MaxDbsOpenHard,
+                max_dbs_open_soft=MaxDbsOpenSoft,
+                max_sweep_size=MaxSweepSize,
                 update_lru_on_read=UpdateLruOnRead,
                 start_time=couch_util:rfc1123_date()}}.
 
@@ -206,10 +216,18 @@ handle_config_change("couchdb", "update_lru_on_read", "true", _, _) ->
     {ok, gen_server:call(couch_server,{set_update_lru_on_read,true})};
 handle_config_change("couchdb", "update_lru_on_read", _, _, _) ->
     {ok, gen_server:call(couch_server,{set_update_lru_on_read,false})};
-handle_config_change("couchdb", "max_dbs_open", Max, _, _) when is_list(Max) ->
-    {ok, gen_server:call(couch_server,{set_max_dbs_open,list_to_integer(Max)})};
-handle_config_change("couchdb", "max_dbs_open", _, _, _) ->
-    {ok, gen_server:call(couch_server,{set_max_dbs_open,?MAX_DBS_OPEN})};
+handle_config_change("couchdb", "max_dbs_open_hard", Max, _, _) when is_list(Max) ->
+    {ok, gen_server:call(couch_server,{set_max_dbs_open_hard,list_to_integer(Max)})};
+handle_config_change("couchdb", "max_dbs_open_hard", _, _, _) ->
+    {ok, gen_server:call(couch_server,{set_max_dbs_open_hard,?MAX_DBS_OPEN_SOFT})};
+handle_config_change("couchdb", "max_dbs_open_soft", Max, _, _) when is_list(Max) ->
+    {ok, gen_server:call(couch_server,{set_max_dbs_open_soft,list_to_integer(Max)})};
+handle_config_change("couchdb", "max_dbs_open_soft", _, _, _) ->
+    {ok, gen_server:call(couch_server,{set_max_dbs_open_soft,?MAX_DBS_OPEN_SOFT})};
+handle_config_change("couchdb", "max_sweep_size", SweepSize, _, _) when is_list(SweepSize) ->
+    {ok, gen_server:call(couch_server,{set_max_sweep_size,list_to_integer(SweepSize)})};
+handle_config_change("couchdb", "max_sweep_size", _, _, _) ->
+    {ok, gen_server:call(couch_server,{set_max_sweep_size,?MAX_SWEEP_SIZE})};
 handle_config_change("admins", _, _, Persist, _) ->
     % spawn here so couch event manager doesn't deadlock
     {ok, spawn(fun() -> hash_admin_passwords(Persist) end)};
@@ -276,14 +294,29 @@ make_room(Server, Options) ->
         true -> {ok, Server}
     end.
 
-maybe_close_lru_db(#server{dbs_open=NumOpen, max_dbs_open=MaxOpen}=Server)
-        when NumOpen < MaxOpen ->
-    {ok, Server};
-maybe_close_lru_db(#server{lru=Lru}=Server) ->
+maybe_close_lru_db(#server{dbs_open=NumOpen, lru=Lru, max_dbs_open_hard=MaxOpenHard}=Server0)
+        when NumOpen > MaxOpenHard ->
     try
-        {ok, db_closed(Server#server{lru = couch_lru:close(Lru)}, [])}
+        Server = db_closed(Server0#server{lru=couch_lru:trim(Lru)}, []),
+        sweep_lru(Server)
     catch error:all_dbs_active ->
         {error, all_dbs_active}
+    end;
+maybe_close_lru_db(Server) ->
+    sweep_lru(Server).
+
+sweep_lru(Server) ->
+    DbsClosing = Server#server.dbs_closing,
+    FutureDbsOpen = Server#server.dbs_open - DbsClosing,
+    MaxClose = Server#server.max_sweep_size - DbsClosing,
+    NumToClose = FutureDbsOpen - Server#server.max_dbs_open_soft,
+    case {MaxClose, NumToClose} of
+        {A, B} when A > 0, B > 0 ->
+            NumToSweep = lists:min([A, B]),
+            gen_server:cast(couch_server, {sweep_lru, NumToSweep}),
+            {ok, Server#server{dbs_closing=DbsClosing + NumToSweep}};
+        _Else ->
+            {ok, Server}
     end.
 
 open_async(Server, From, DbName, Filepath, Options) ->
@@ -317,18 +350,31 @@ open_async(Server, From, DbName, Filepath, Options) ->
     true = ets:insert(couch_dbs_pid_to_name, {Opener, DbName}),
     db_opened(Server, Options).
 
-handle_call(close_lru, _From, #server{lru=Lru} = Server) ->
-    try
-        {reply, ok, db_closed(Server#server{lru = couch_lru:close(Lru)}, [])}
-    catch error:all_dbs_active ->
-        {reply, {error, all_dbs_active}, Server}
-    end;
 handle_call(open_dbs_count, _From, Server) ->
     {reply, Server#server.dbs_open, Server};
 handle_call({set_update_lru_on_read, UpdateOnRead}, _From, Server) ->
     {reply, ok, Server#server{update_lru_on_read=UpdateOnRead}};
-handle_call({set_max_dbs_open, Max}, _From, Server) ->
-    {reply, ok, Server#server{max_dbs_open=Max}};
+handle_call({set_max_dbs_open_hard, MaxHard}, _From, Server) ->
+    case Server#server.max_dbs_open_soft of
+        MaxSoft when MaxSoft =< MaxHard ->
+            {reply, ok, Server#server{max_dbs_open_hard=MaxHard}};
+        _Else ->
+            {reply, ok, Server}
+    end;
+handle_call({set_max_dbs_open_soft, MaxSoft}, _From, Server) ->
+    case {Server#server.max_dbs_open_hard, Server#server.max_sweep_size} of
+        {MaxHard, MaxSweepSize} when MaxHard >= MaxSoft, MaxSweepSize < MaxSoft ->
+            {reply, ok, Server#server{max_dbs_open_soft=MaxSoft}};
+        _Else ->
+            {reply, ok, Server}
+    end;
+handle_call({set_max_sweep_size, MaxSweepSize}, _From, Server) ->
+    case Server#server.max_dbs_open_soft of
+        MaxSoft when MaxSoft > MaxSweepSize ->
+            {reply, ok, Server#server{max_sweep_size=MaxSweepSize}};
+        _Else ->
+            {reply, ok, Server}
+    end;
 handle_call(get_server, _From, Server) ->
     {reply, {ok, Server}, Server};
 handle_call({open_result, T0, DbName, {ok, Db}}, {FromPid, _Tag}, Server) ->
@@ -489,6 +535,28 @@ handle_call({db_updated, #db{}=Db}, _From, Server0) ->
     end,
     {reply, ok, Server}.
 
+handle_cast({close, DbName}, #server{dbs_closing=DbsClosing, lru=Lru0}=Server0) ->
+    Server1 = case couch_lru:close(DbName, Lru0) of
+                  {ok, Lru} ->
+                      db_closed(Server0#server{lru=Lru}, []);
+                  {missing, Lru} ->
+                      Server0#server{lru=Lru};
+                  {error, db_active} ->
+                      Server0
+              end,
+    case DbsClosing - 1 of
+        N when N < 0 ->
+            {noreply, Server1#server{dbs_closing=0}};
+        0 ->
+            {ok, Server2} = sweep_lru(Server1#server{dbs_closing=0}),
+            {noreply, Server2};
+        N ->
+            {noreply, Server1#server{dbs_closing=N}}
+    end;
+handle_cast({sweep_lru, NumToSweep}, #server{dbs_closing=DbsClosing, lru=Lru0}=Server) ->
+    {NumSweeped, Lru} = couch_lru:sweep(NumToSweep, Lru0),
+    Delta = NumToSweep - NumSweeped,
+    {noreply, Server#server{dbs_closing=DbsClosing - Delta, lru=Lru}};
 handle_cast({update_lru, DbName}, #server{lru = Lru, update_lru_on_read=true} = Server) ->
     {noreply, Server#server{lru = couch_lru:update(DbName, Lru)}};
 handle_cast({update_lru, _DbName}, Server) ->
